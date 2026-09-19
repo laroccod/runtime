@@ -62,6 +62,10 @@ dev = [
 [project.scripts]
 gitm = "gitm.cli:main"
 gitm-run-workload = "gitm.runtime_driver:main"
+# Part 2 attribution contracts (docs/deepseek-v4-flash/ATTRIBUTION-NOTE.md); also
+# runnable as `python -m gitm.attribution.simulate` / `.attribute`.
+simulate = "gitm.attribution.simulate:main"
+attribute = "gitm.attribution.attribute:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["gitm"]

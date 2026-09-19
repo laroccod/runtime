@@ -1,0 +1,12 @@
+# Degenerate graph: one region, no overlaps, additive cost only, passive.
+# Expected: serialization absent (nothing to act on); additive present but confounded with
+# beta unless the corner rule applies (here alpha = 1 so beta = 0 and c is estimated).
+graph:
+  floors_ms: {step: 3.0}
+  overlaps: []
+
+additive: {c_ms: 0.4}
+noise:    {cv_region: 0.03, cv_total: 0.01}
+
+conditions:
+  - {name: passive, steps_fraction: 1.0, overrides: {}}

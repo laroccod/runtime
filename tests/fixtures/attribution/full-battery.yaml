@@ -1,0 +1,30 @@
+# All five mechanisms on, with both separating interventions as extra arms.
+# Used for the recovery (pull) test at two sample sizes.
+graph:
+  floors_ms:
+    moe_routed: 2.0418
+    attn_proj: 0.1855
+    attn_compress: 0.1345
+    moe_shared: 0.2360
+    attn_core: 0.0729
+    attn_index: 0.0433
+    hc_mix: 0.1409
+    collectives: 0.1150
+    lm_head: 0.0288
+    moe_router: 0.0431
+    embed: 0.0001
+  overlaps:
+    - {earlier: moe_routed, later: moe_shared, overlap_ms: 0.2360}
+    - {earlier: attn_index, later: attn_compress, overlap_ms: 0.0433}
+
+slowdown:      {regions: [moe_routed], alpha: {moe_routed: 1.4}}
+serialization: {s: 0.5}
+additive:      {c_ms: 0.8}
+regime_gate:   {regions: [attn_core], gamma: 1.3, tau: 12}
+observation:   {beta: 0.15}
+noise:         {cv_region: 0.03, cv_total: 0.01}
+
+conditions:
+  - {name: passive,    steps_fraction: 0.4, overrides: {}}
+  - {name: low_instr,  steps_fraction: 0.3, overrides: {observation: {beta: 0.0}}}
+  - {name: slow_index, steps_fraction: 0.3, overrides: {slowdown: {alpha: {attn_index: 1.6}}}}
