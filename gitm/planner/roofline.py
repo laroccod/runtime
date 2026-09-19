@@ -453,8 +453,18 @@ class SparseMoEModelSpec:
 
     @property
     def q_head_dim(self) -> int:
-        """Per-head query width: the nope part plus the RoPE part."""
-        return self.head_dim + self.qk_rope_head_dim
+        """Per-head query width. ``head_dim`` already contains the RoPE slice.
+
+        On DeepSeek-V4-Flash the RoPE dimensions are the *last*
+        ``qk_rope_head_dim`` of ``head_dim``, not a block appended to it:
+        ``nope_head_dim = head_dim - rope_head_dim``, ``wq_b`` projects to
+        ``n_heads * head_dim`` and RoPE is applied to ``q[..., -rd:]``
+        (``inference/model.py``, ``Attention.__init__`` / ``forward``); the
+        shards store ``wq_b.weight [32768, 1024]`` = 64 x 512. Adding the two,
+        the DeepSeek-V3 ``qk_nope_head_dim + qk_rope_head_dim`` convention,
+        widened every q-side and KV term by 576/512.
+        """
+        return self.head_dim
 
     @property
     def kv_latent_dim(self) -> int:
@@ -464,8 +474,13 @@ class SparseMoEModelSpec:
         that sharing is the entire point of the compressed-KV design, and folding
         it into ``n_heads`` (as a GQA model would) overstates decode KV traffic
         by ``n_heads``x.
+
+        One entry is ``head_dim`` wide with the RoPE slice inside it:
+        ``wkv = Linear(dim, head_dim)`` and the cache buffer is
+        ``[batch, kv_cache_size, head_dim]`` (``inference/model.py``,
+        ``Attention.__init__``); the shards store ``wkv.weight [512, 4096]``.
         """
-        return self.num_kv_heads * (self.head_dim + self.qk_rope_head_dim)
+        return self.num_kv_heads * self.head_dim
 
 
 @dataclass(frozen=True)

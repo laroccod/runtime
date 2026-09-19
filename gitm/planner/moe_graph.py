@@ -238,8 +238,10 @@ def kv_entry_bytes(spec: SparseMoEModelSpec) -> float:
 
     Paper §2.3.4: the RoPE dimensions are kept in BF16 while the rest is FP8,
     "reducing the KV cache size by nearly half compared with pure BF16". Pricing
-    the whole entry at FP8 understates it — on this checkpoint by 11%, since 64
-    of the 576 dimensions carry double width.
+    the whole entry at FP8 understates it — on this checkpoint by 12.5%, since 64
+    of the 512 dimensions carry double width (``inference/model.py``,
+    ``Attention.forward``: ``act_quant(kv[..., :-rd], ...)`` with the comment
+    "rope dims stay bf16").
     """
     rope = spec.qk_rope_head_dim * spec.num_kv_heads
     rest = spec.kv_latent_dim - rope

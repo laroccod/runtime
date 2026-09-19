@@ -320,13 +320,29 @@ def test_compress_ratios_truncate_to_layer_count(spec):
 
 
 def test_kv_latent_is_shared_across_query_heads(spec):
-    """num_kv_heads == 1: one latent of 512+64, not 64 heads of it.
+    """num_kv_heads == 1: one latent of 512, not 64 heads of it.
 
     Modelling this as GQA would inflate decode KV traffic 64x and make every
     long-context run look catastrophically memory-bound.
     """
-    assert spec.kv_latent_dim == 512 + 64
+    assert spec.kv_latent_dim == 512
     assert spec.kv_latent_dim < spec.n_heads * spec.head_dim
+
+
+def test_rope_slice_lives_inside_head_dim(spec):
+    """``head_dim`` is 512 *including* the 64 RoPE dims, not 512 + 64.
+
+    ``inference/model.py`` sets ``nope_head_dim = head_dim - rope_head_dim``,
+    projects ``wq_b`` to ``n_heads * head_dim`` and ``wkv`` to ``head_dim``, and
+    rotates ``[..., -rd:]`` of each; the shards store ``wq_b.weight
+    [32768, 1024]`` and ``wkv.weight [512, 4096]``. The V3 convention of adding
+    a separate RoPE block would widen every q-side and KV term by 576/512 and
+    misprice the KV entry (and so the concurrency ceiling) by the same ratio.
+    """
+    assert spec.n_heads * spec.q_head_dim == 32768  # wq_b rows
+    assert spec.kv_latent_dim == 512  # wkv rows == one cache entry
+    # 448 dims at fp8 (one byte each) + 64 RoPE dims kept in bf16
+    assert kv_entry_bytes(spec) == pytest.approx(448 * weight_bytes("fp8") + 64 * 2)
 
 
 # ── the assembled graph ─────────────────────────────────────────────────────
