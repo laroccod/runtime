@@ -589,17 +589,28 @@ def predict_moe_graph(
     # accepted, which is why ``BatchConfig.acceptance_rate`` belongs in the
     # per-token denominator and not in this node's cost.
     #
+    # Emitted only under a speculative config. ``num_nextn_predict_layers`` says
+    # the draft blocks are *shipped*, not that they run: DeepSeek-V4-Flash's
+    # reference implementation runs ``self.layers`` in ``Transformer.forward``
+    # and the ``mtp.*`` blocks only in a separate ``forward_spec``
+    # (``inference/model.py``), which a server without speculation never calls.
+    # Same rule as ``glm_graph`` and ``hybrid_graph`` (``with_mtp``): a
+    # non-speculative step has no draft head in it, and emitting one anyway put
+    # a phantom full layer (attention + a 256-expert MoE) into every prediction
+    # for this family.
+    #
     # Deliberately *not* given distinct op names. An MTP layer's q_a projection
     # is a q_a projection; what makes it the draft head is its position in the
     # stack, which ``layer >= n_layers`` already says. Renaming the ops would
     # invent identities that no kernel name can ever match, leaving every MTP
     # node predicted-but-never-observed. Layer index is the disambiguator here,
     # exactly as ``docs/kernel_identity.md`` specifies.
-    for i in range(spec.num_nextn_predict_layers):
-        _emit_layer(
-            g, spec, hw, spec.n_layers + i,
-            positions=sequences, sequences=sequences, kv_len=kv_len, sh=sh,
-        )
+    if batch.speculative_tokens > 0:
+        for i in range(spec.num_nextn_predict_layers):
+            _emit_layer(
+                g, spec, hw, spec.n_layers + i,
+                positions=sequences, sequences=sequences, kv_len=kv_len, sh=sh,
+            )
 
     # Vocabulary projection: logits for every position the step computed, since a
     # speculative step needs a distribution at each drafted position to verify it.

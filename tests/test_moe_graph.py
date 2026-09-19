@@ -389,9 +389,27 @@ def test_speculative_positions_amortise_cache_reads_but_not_flops(spec, b200):
 
 def test_mtp_head_emits_layers_beyond_the_stack(spec, b200):
     """The draft head is layer 43, not a renamed op — layer index is the identity."""
-    g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    g = predict_moe_graph(
+        spec, b200, BatchConfig(batch=1, kv_cache_len=1024, speculative_tokens=1)
+    )
     layers = {n.layer for n in g.nodes if n.layer is not None}
     assert max(layers) == spec.n_layers  # 43 == one MTP layer past 0..42
+
+
+def test_mtp_head_is_absent_without_speculation(spec, b200):
+    """``num_nextn_predict_layers`` says the draft blocks ship, not that they run.
+
+    DeepSeek-V4-Flash's reference implementation runs ``mtp.*`` only in
+    ``Transformer.forward_spec``; a server without speculation never calls it.
+    Pricing the head anyway put a phantom full layer into every non-speculative
+    step. The weights stay in the footprint: resident is not the same as run.
+    """
+    g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    layers = {n.layer for n in g.nodes if n.layer is not None}
+    assert max(layers) == spec.n_layers - 1
+    assert model_weight_bytes(spec) > model_weight_bytes(
+        replace(spec, num_nextn_predict_layers=0)
+    )
 
 
 def test_dspark_only_on_its_declared_layers(spec, b200):
