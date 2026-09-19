@@ -27,7 +27,8 @@ and they dominate the attention cost at long sequence lengths. Folding these int
 one op — as a dense graph must — averages a 13x spread at 1M context and
 attributes deviation to whichever layer happened to be modelled.
 
-**Precision is per-tensor-class.** Experts run fp4, linears fp8, the KV cache fp8.
+**Precision is per-tensor-class.** Routed experts run fp4; the shared expert and
+the linears fp8; the KV cache fp8.
 The load-bearing half of this is *bytes*, not FLOPs: pricing fp4 expert weights at
 bf16 inflates the dominant term 3.3x. The peak-FLOPS half barely moves a decode
 step — every node is memory-bound, so the compute ceiling never binds — but it
@@ -51,9 +52,9 @@ Known limits, stated rather than hidden:
   Real routing is skewed, which touches *fewer* distinct experts and so moves less
   weight traffic than predicted — the conservative direction, since it under-reports
   headroom rather than inventing it.
-* **Nodes marked** ``estimated`` **are documented approximations** (grouped output
-  projection, DSpark, every collective) and carry that flag into the report so an
-  estimate is never read as a measurement.
+* **Nodes marked** ``estimated`` **are documented approximations** (DSpark, every
+  collective) and carry that flag into the report so an estimate is never read
+  as a measurement.
 * **Expert-parallel skew is calibrated, not predicted.**
   :attr:`ShardingConfig.ep_imbalance` defaults to perfect balance; the real figure
   comes from a trace. Inventing a routing distribution here would be a guess
@@ -153,8 +154,9 @@ def model_weight_bytes(
 
     Decides whether a deployment shape is possible at all, which the timing graph
     cannot: a config that predicts beautifully and does not fit is not a config.
-    Counts experts at ``expert_dtype`` and everything else at ``weight_dtype``,
-    since collapsing the two is a ~3x error on the dominant term.
+    Counts routed experts at ``expert_dtype`` and everything else, the shared
+    expert included, at ``weight_dtype``, since collapsing the two is a ~3x error
+    on the dominant term.
 
     Validated against ground truth: ``DeepSeek-V4-Flash`` predicts 156 GB against
     a published 160 GB checkpoint (-2.4%), the residual being norms, biases and
@@ -176,14 +178,16 @@ def model_weight_bytes(
     layers = spec.n_layers + spec.num_nextn_predict_layers
 
     experts = layers * spec.n_routed_experts * 3 * h * inter * ew / es
-    shared = layers * spec.n_shared_experts * 3 * h * inter * ew / tp
+    shared = layers * spec.n_shared_experts * 3 * h * inter * ww / tp  # fp8, not expert_dtype
     attn_per_layer = (
         h * spec.q_lora_rank  # q_a, replicated
         + spec.q_lora_rank * spec.n_heads * spec.q_head_dim / tp
         + h * spec.kv_latent_dim  # kv_a, replicated
         + h * spec.index_n_heads * spec.index_head_dim / tp
-        + spec.n_heads * spec.head_dim * spec.o_lora_rank / (spec.o_groups * tp)
-        + spec.o_lora_rank * h
+        # grouped output projection, wo_a [o_groups*o_lora_rank, n_heads*head_dim/o_groups]
+        # and wo_b [h, o_groups*o_lora_rank], both sharded by tp (see _emit_layer)
+        + spec.n_heads * spec.head_dim * spec.o_lora_rank / tp
+        + spec.o_groups * spec.o_lora_rank * h / tp
         + h * spec.n_routed_experts  # router, replicated
     )
     embed = 2 * spec.vocab * h / tp  # input embedding + untied lm_head
@@ -236,8 +240,10 @@ def kv_entry_bytes(spec: SparseMoEModelSpec) -> float:
 
     Paper §2.3.4: the RoPE dimensions are kept in BF16 while the rest is FP8,
     "reducing the KV cache size by nearly half compared with pure BF16". Pricing
-    the whole entry at FP8 understates it — on this checkpoint by 11%, since 64
-    of the 576 dimensions carry double width.
+    the whole entry at FP8 understates it — on this checkpoint by 12.5%, since 64
+    of the 512 dimensions carry double width (``inference/model.py``,
+    ``Attention.forward``: ``act_quant(kv[..., :-rd], ...)`` with the comment
+    "rope dims stay bf16").
     """
     rope = spec.qk_rope_head_dim * spec.num_kv_heads
     rest = spec.kv_latent_dim - rope
@@ -401,16 +407,27 @@ def _emit_layer(
         spec.act_dtype,
     )
 
-    # Output projection, grouped and low-rank. ``o_groups`` partitions the head
-    # dimension so each group carries its own slice of the rank — modelled as an
-    # even split, which is the documented reading of the config and not a
-    # published shape, hence ``estimated``.
-    o_in = spec.n_heads * spec.head_dim // tp
-    f_a, b_a = _linear(positions, o_in, max(1, spec.o_lora_rank // spec.o_groups), aw, ww)
-    f_b, b_b = _linear(positions, spec.o_lora_rank, h, aw, ww)
+    # Output projection, grouped and low-rank. ``o_groups`` partitions the heads
+    # into groups and *every group carries the full* ``o_lora_rank``: wo_a is
+    # ``[o_groups * o_lora_rank, n_heads * head_dim / o_groups]``, applied
+    # block-diagonally with one ``[o_lora_rank, group_width]`` block per group,
+    # and wo_b maps the concatenated ``o_groups * o_lora_rank`` back to hidden.
+    # DeepSeek-V4-Flash ``inference/model.py``, ``Attention.__init__``:
+    # ``wo_a = ColumnParallelLinear(n_heads * head_dim // n_groups, n_groups *
+    # o_lora_rank)``, ``wo_b = RowParallelLinear(n_groups * o_lora_rank, dim)``;
+    # ``forward``: ``einsum("bsgd,grd->bsgr", o, wo_a.view(groups, rank, -1))``.
+    # Shard shapes agree: ``wo_a.weight [8192, 4096]``, ``wo_b.weight [4096,
+    # 8192]``, fp8. Reading the rank as split *across* the groups priced wo_a
+    # 8x small. Groups shard with the heads under TP (``n_local_groups =
+    # n_groups // world_size``), so per rank wo_a is ``[o_groups * o_lora_rank /
+    # tp, group_width]`` and wo_b is ``[hidden, o_groups * o_lora_rank / tp]``.
+    group_width = spec.n_heads * spec.head_dim // max(1, spec.o_groups)
+    o_rank = max(1, spec.o_groups * spec.o_lora_rank // tp)
+    f_a, b_a = _linear(positions, group_width, o_rank, aw, ww)
+    f_b, b_b = _linear(positions, o_rank, h, aw, ww)
     # Named to match the dense graph's output projection: it is the same op in
     # the same place, so residuals for it stay comparable across model families.
-    add("attn_out_proj", f_a + f_b, b_a + b_b, wd, estimated=True)
+    add("attn_out_proj", f_a + f_b, b_a + b_b, wd)
 
     # ── manifold-constrained hyper-connections ──────────────────────────────
     # Two per block (around attention, around the MoE). The residual stream is
@@ -463,12 +480,19 @@ def _emit_layer(
     per_position_flops = 6.0 * h * inter  # 2 * (gate + up + down) * h * inter
 
     if spec.n_shared_experts > 0:
+        # The shared expert is not an ``expert_dtype`` tensor. The reference
+        # builds routed experts with ``dtype=expert_dtype`` and the shared expert
+        # on the default (fp8) path (``inference/model.py``, ``MoE.__init__``:
+        # ``Expert(..., dtype=expert_dtype)`` vs ``Expert(args.dim,
+        # args.moe_inter_dim, ...)``), and the shards store
+        # ``ffn.shared_experts.w{1,2,3}.weight`` as fp8 e4m3 with 128x128
+        # scales. Pricing it at fp4 alongside the routed bank halved its bytes.
         add(
             "moe_shared",
             per_position_flops * positions * spec.n_shared_experts / tp,
-            per_expert_weights * spec.n_shared_experts * ew / tp
+            per_expert_weights * spec.n_shared_experts * ww / tp
             + aw * (positions * h * 2 + positions * inter * 2 * spec.n_shared_experts / tp),
-            ed,
+            wd,
         )
 
     # Shared with the dense MoE roofline — one owner for the union term. Note the
@@ -589,17 +613,28 @@ def predict_moe_graph(
     # accepted, which is why ``BatchConfig.acceptance_rate`` belongs in the
     # per-token denominator and not in this node's cost.
     #
+    # Emitted only under a speculative config. ``num_nextn_predict_layers`` says
+    # the draft blocks are *shipped*, not that they run: DeepSeek-V4-Flash's
+    # reference implementation runs ``self.layers`` in ``Transformer.forward``
+    # and the ``mtp.*`` blocks only in a separate ``forward_spec``
+    # (``inference/model.py``), which a server without speculation never calls.
+    # Same rule as ``glm_graph`` and ``hybrid_graph`` (``with_mtp``): a
+    # non-speculative step has no draft head in it, and emitting one anyway put
+    # a phantom full layer (attention + a 256-expert MoE) into every prediction
+    # for this family.
+    #
     # Deliberately *not* given distinct op names. An MTP layer's q_a projection
     # is a q_a projection; what makes it the draft head is its position in the
     # stack, which ``layer >= n_layers`` already says. Renaming the ops would
     # invent identities that no kernel name can ever match, leaving every MTP
     # node predicted-but-never-observed. Layer index is the disambiguator here,
     # exactly as ``docs/kernel_identity.md`` specifies.
-    for i in range(spec.num_nextn_predict_layers):
-        _emit_layer(
-            g, spec, hw, spec.n_layers + i,
-            positions=sequences, sequences=sequences, kv_len=kv_len, sh=sh,
-        )
+    if batch.speculative_tokens > 0:
+        for i in range(spec.num_nextn_predict_layers):
+            _emit_layer(
+                g, spec, hw, spec.n_layers + i,
+                positions=sequences, sequences=sequences, kv_len=kv_len, sh=sh,
+            )
 
     # Vocabulary projection: logits for every position the step computed, since a
     # speculative step needs a distribution at each drafted position to verify it.

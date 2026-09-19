@@ -1,0 +1,259 @@
+# DeepSeek-V4-Flash-0731 — sparse-MoE decoder. Three attention kinds (sliding
+# window / compressed-by-4 with an indexer / compressed-by-128 attended densely),
+# fp4 routed experts, fp8 linears, hyper-connections, three hash-routed leading
+# layers, and a three-block speculative head that does not run at the baseline.
+#
+# Source: the checkpoint's own files at one pinned revision, nothing else.
+#   repo      deepseek-ai/DeepSeek-V4-Flash-0731
+#   revision  7872f01b1d1fe23eabc4c98b48bffcef5a386062
+#   config.json                   HF format; the keys quoted below.
+#   inference/config.json         reference-implementation args. Same quantities
+#                                 under different names (dim/hidden_size,
+#                                 n_layers/num_hidden_layers, window_size/
+#                                 sliding_window, ...); cited only where it says
+#                                 something the HF file does not.
+#   inference/model.py            how each key is consumed; cited as model.py:N.
+#   model.safetensors.index.json  tensor names and shard map only, NO shapes or dtypes.
+#   48 shard headers              every shape and dtype below; their byte sum equals
+#                                 the index's total_size exactly (166,878,536,440 B).
+#
+# Why this revision: 0731 is the newest text-only V4 Flash. Its 43 executed
+# layers are tensor-for-tensor identical to the base revision (every differing
+# tensor is under mtp.*, which the baseline never runs), so the choice affects
+# only the speculative head and the reconciliation, not this graph. V4.1-Flash
+# is a different architecture (deepseek_v41, vision tower); Vision-Exp is not
+# text-only.
+#
+# Baseline for every claim here and in the design note: one 8xH200 SXM node over
+# NVLink, TP8, FP8 weights and KV where the checkpoint supports it, 32 active
+# sequences in decode, 8,192 cached tokens each, one new token per sequence per
+# step, text-only, speculation disabled.
+#
+# Shapes are quoted as stored, [out, in] (model.py:145).
+
+name: deepseek-ai/DeepSeek-V4-Flash-0731
+family: sparse_moe
+description: >
+  43 layers, all MoE (256 routed fp4 experts, top-6, one fp8 shared expert).
+  Attention: 2 sliding-window layers (0, 1), 21 compressed-by-4 layers with a
+  lightning indexer (2, 4, ..., 42), 20 compressed-by-128 layers attended densely
+  (3, 5, ..., 41). One 512-wide KV head serves as both key and value for all 64
+  query heads. Layers 0-2 route experts by token id. Hyper-connections widen the
+  residual stream 4x. Three mtp.* blocks (each a full MoE layer) exist in the
+  checkpoint and run only under speculation, which the baseline disables.
+
+spec:
+  # ── dimensions ─────────────────────────────────────────────────────────────
+  hidden: 4096                      # hidden_size; embed.weight [129280, 4096]
+  n_layers: 43                      # num_hidden_layers; layers.0 .. layers.42
+  vocab: 129280                     # vocab_size; embed and head are separate BF16
+                                    # tensors (tie_word_embeddings: false)
+
+  # ── attention ──────────────────────────────────────────────────────────────
+  # One KV head of width head_dim is both key and value for every query head:
+  # model.py:466 `wkv = Linear(dim, head_dim)`, :533 `sparse_attn(q, kv, ...)`;
+  # wkv.weight is [512, 4096]. The per-token cache entry is 512 elements and
+  # tensor parallelism cannot split it: every rank reads the whole cache.
+  n_heads: 64                       # num_attention_heads; wq_b.weight [32768, 1024] = 64 x 512
+  num_kv_heads: 1                   # num_key_value_heads
+  head_dim: 512                     # head_dim
+  # SURPRISE: the 64 RoPE dims live INSIDE head_dim, not on top of it.
+  # model.py:455 `nope_head_dim = head_dim - rope_head_dim`; :505 and :510
+  # rotate the last 64 of a 512-wide q and kv. Adding the two (576) overstates
+  # wq_b and the KV entry by 12.5 % (RECONCILIATION.md B5/B6).
+  qk_rope_head_dim: 64              # qk_rope_head_dim (inference: rope_head_dim)
+  q_lora_rank: 1024                 # wq_a [1024, 4096] -> q_norm [1024] -> wq_b [32768, 1024]
+  # No kv_lora_rank key and no wkv_b tensor: the 512-wide entry is used as is,
+  # not decompressed per head. This is MQA with K == V, not MLA.
+  #
+  # Grouped low-rank output projection. Every group carries the FULL
+  # o_lora_rank (model.py:468-469): wo_a [8192, 4096] and wo_b [4096, 8192],
+  # both FP8 in the checkpoint, 67.1 M parameters per layer. Reading o_groups
+  # as a divisor of the rank gives 8.4 M (RECONCILIATION.md B3).
+  o_lora_rank: 1024
+  o_groups: 8
+  # attn_sink: one fp32 scalar per head, [64], added to the softmax
+  # denominator (model.py:462, :533). Weightless; no spec field.
+
+  # ── sparse attention: window, compression, indexer ─────────────────────────
+  sliding_window: 128               # sliding_window (inference: window_size); model.py:513
+  # compress_ratios[layer_id] selects the attention kind (model.py:459, :472-477):
+  #   0    no Compressor: sliding window only                            swa
+  #   4    Compressor and Indexer (overlapping windows, :296)             csa
+  #   128  Compressor, indexer = None: dense over all compressed entries  hca
+  # Written out because it does not tile: layers 0-1 are 0, then 4/128
+  # alternate from layer 2 and the stack ends on 4 at layer 42, so the two
+  # compressed kinds are asymmetric, 21 csa against 20 hca.
+  # The list is 46 long for 43 layers. The tail is not padding: the three
+  # mtp.* blocks are indexed as n_layers + stage (model.py:825, :902) and their
+  # attention asserts ratio 0 (:753). Kept verbatim so layers >= 43 classify as
+  # swa; the planner's config reader truncates the tail (RECONCILIATION.md B2).
+  compress_ratios: [
+    0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,   # layers  0-15
+    4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128,  # layers 16-31
+    4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4,                       # layers 32-42
+    0, 0, 0,                                                         # mtp.0, mtp.1, mtp.2
+  ]
+  # Shard-header evidence per kind (all layers of a kind are shape-identical;
+  # docs/deepseek-v4-flash/shapes_from_shards.py):
+  #   swa  no attn.compressor.*, no attn.indexer.*
+  #   csa  attn.compressor.{wkv,wgate} BF16 [1024, 4096] (2 x head_dim: the
+  #        overlapping and current windows, model.py:298-304), ape F32 [4, 1024];
+  #        attn.indexer.wq_b F8 [8192, 1024], weights_proj BF16 [64, 4096], and
+  #        the indexer's own compressor {wkv,wgate} BF16 [256, 4096], ape F32 [4, 256]
+  #   hca  attn.compressor.{wkv,wgate} BF16 [512, 4096], ape F32 [128, 512]
+  # SURPRISE: compressor weights are BF16, computed in fp32 (model.py:327-330),
+  # replicated (plain Linear), and the csa indexer has a compressor of its own.
+  # The spec has no field for any of it (RECONCILIATION.md B4).
+  index_n_heads: 64                 # index_n_heads; indexer.wq_b [8192, 1024] = 64 x 128
+  index_head_dim: 128               # index_head_dim; indexer cache is [B, S/4, 128] (model.py:405)
+  index_topk: 512                   # index_topk; keeps min(512, S/4) compressed entries (model.py:433)
+  # Entries read per layer at S = 8192 (window :513, topk :433, all compressed
+  # :519, concatenated :520): swa 128; csa 128 + min(512, 2048) = 640;
+  # hca 128 + 8192/128 = 192. The indexer scores all S/4 = 2048 candidates (:426).
+
+  # ── mixture of experts ─────────────────────────────────────────────────────
+  n_routed_experts: 256             # ffn.experts.0 .. .255 on every layer; no dense FFN anywhere
+  n_shared_experts: 1               # ffn.shared_experts.*; model.py:631 asserts == 1
+  num_experts_per_tok: 6            # num_experts_per_tok (inference: n_activated_experts)
+  moe_intermediate_size: 2048       # experts.N.w1 logical [2048, 4096]; w2 [4096, 2048]
+  # Routing: sqrtsoftplus scores (model.py:576), noaux_tc selection through
+  # ffn.gate.bias F32 [256] (:579-580), weights renormalised (:587) and scaled
+  # by routed_scaling_factor 1.5 (:588). None of this changes bytes or FLOPs;
+  # it changes WHICH experts fire, i.e. the routing assumption behind the
+  # distinct-expert term.
+  # SURPRISE: layers 0-2 carry ffn.gate.tid2eid I64 [129280, 6] instead of
+  # gate.bias: expert ids come from the token id (model.py:561, :582). The
+  # router GEMM still runs for the routing weights (:570 is unconditional,
+  # :585 gathers from its scores), and the expert distribution on these layers
+  # follows token frequency, not uniform routing (RECONCILIATION.md B10).
+  num_hash_layers: 3                # num_hash_layers (inference: n_hash_layers)
+
+  # ── hyper-connections (mHC) ────────────────────────────────────────────────
+  # The residual stream is hc_mult x hidden wide (model.py:916). Two mixers per
+  # block, hc_attn_* and hc_ffn_* (:672-678), each hc_*_fn F32 [24, 16384] with
+  # 24 = (2 + hc_mult) * hc_mult (:670) and 16384 = hc_mult * hidden. Sinkhorn
+  # runs hc_sinkhorn_iters iterations (:686).
+  # SURPRISE: FP32 and replicated; the planner prices them at weight_dtype
+  # (RECONCILIATION.md B11).
+  hc_width: 4                       # hc_mult
+  hc_sinkhorn_iters: 20             # hc_sinkhorn_iters
+  hc_blocks_per_layer: 2
+
+  # ── speculative head (does not run at the baseline) ────────────────────────
+  # The HF config says 1. Three independent witnesses say 3: the index carries
+  # mtp.0, mtp.1, mtp.2 (4,705 tensors, 10.86 GB); inference/config.json says
+  # n_mtp_layers: 3; compress_ratios has exactly three trailing entries. Each
+  # block is a full Block (attention + 256-expert MoE, model.py:818-823), the
+  # size of a backbone layer. They execute only in forward_spec (:928-936),
+  # never in forward (:912-926); a planner that emits them with speculation off
+  # overcounts by three layers (RECONCILIATION.md B1). Whether an engine keeps
+  # mtp.* resident with speculation off is a serving question (open Q3).
+  num_nextn_predict_layers: 3
+  # dspark_target_layer_ids names the layers whose hidden state is collected
+  # (model.py:918-921) for mtp.0.main_proj. No extra tensor or op belongs to
+  # them at the baseline; a per-layer `dspark` node is a phantom
+  # (RECONCILIATION.md B8).
+  dspark_layer_ids: [40, 41, 42]
+  dspark_markov_rank: 256           # markov_w1/w2 BF16 [129280, 256] in mtp.2
+
+  # ── precision, per tensor class (from shard headers, not quantization_config) ─
+  #   routed experts  fp4: w1/w3 stored I8 [2048, 2048] = logical [2048, 4096]
+  #                   ("float4_e2m1fn_x2", model.py:138-140), 4.00 bits per
+  #                   parameter; scale F8_E8M0 [2048, 128] = one byte per 32
+  #                   elements along K (fp4_block_size = 32, model.py:18, :142),
+  #                   6.25 % of expert weight bytes.
+  #   fp8 linears     F8_E4M3 with F8_E8M0 scales per 128x128 block
+  #                   (quantization_config; wq_b scale [256, 8]). The 128x128
+  #                   block applies to the fp8 path only; applying it to the
+  #                   experts understates their scales 512x (~8 GB).
+  #   shared expert   FP8, not fp4: shared_experts.w1 F8_E4M3 [2048, 4096] with
+  #                   [16, 32] scales; model.py:632 builds it without expert_dtype
+  #                   (RECONCILIATION.md B9).
+  #   embed, head     BF16 [129280, 4096] each (head: model.py:728).
+  #   router          gate.weight BF16 [256, 4096], scored in fp32 (model.py:570).
+  #   compressors     BF16 weights, fp32 compute. indexer.weights_proj BF16.
+  #   mHC, ape, sinks FP32.  norms BF16.
+  weight_dtype: fp8                 # quantization_config.quant_method
+  expert_dtype: fp4                 # expert_dtype (routed experts only)
+  # KV cache: the reference keeps it BF16 and fp8-simulates the 448 non-RoPE
+  # dims with one scale per 64, leaving the 64 RoPE dims bf16 (model.py:511-512,
+  # :532). The baseline asks for FP8 KV where supported; the fp8 QAT makes it
+  # supported, and storing it that way is a serving decision (open Q1). Entry
+  # at fp8: 448 B + 128 B + 7 scales (RECONCILIATION.md B6).
+  kv_dtype: fp8
+  act_dtype: bf16                   # torch_dtype bfloat16
+
+provenance:
+  verified:
+    - claim: every shape and dtype above is read from the shard headers, and the
+        headers account for the whole checkpoint
+      detail: >
+        48 shard headers, 72,317 tensors, byte sum 166,878,536,440 == the index's
+        metadata.total_size. One layer per shard (layer N in shard N+2). All 20
+        hca layers are shape-identical, all 20 learned-router csa layers are
+        shape-identical, layer 2 differs from them only by tid2eid/bias, and
+        layers 0-1 are identical. docs/deepseek-v4-flash/shapes_from_shards.py.
+    - claim: the attention-kind schedule is read off config.json, not assumed
+      detail: >
+        compress_ratios[layer_id] selects the kind at model.py:472-477, and the
+        shard headers confirm it tensor by tensor: attn.indexer.* exists on
+        exactly the 21 ratio-4 layers, attn.compressor.* on exactly the 41
+        nonzero-ratio layers, neither on layers 0-1.
+    - claim: routed experts are fp4 with 1x32 e8m0 scales; the planner's fp4
+        byte constant (0.5 + 1/32) matches exactly
+      detail: >
+        Stored I8 [2048, 2048] against logical [2048, 4096] = 4.00 bits/param;
+        scale [2048, 128] = 4096/32 one-byte entries. 33,024 expert matrices:
+        138.51 GB of weights + 8.66 GB of scales = 95.6 % of the executed stack.
+    - claim: three mtp.* blocks, not one
+      detail: >
+        Index, inference/config.json and the compress_ratios tail agree; the HF
+        num_nextn_predict_layers: 1 is the outlier. 0731 minus the base revision
+        is 7.27 GB = mtp.1 (3.56 GB) + mtp.2 (3.69 GB), which is the planner's
+        "DSpark shape is not public" gap (moe_graph.py model_weight_bytes
+        docstring): the missing bytes are two full MoE layers.
+    - claim: the executed stack is 153.90 GB; globals 2.12 GB; mtp.* 10.86 GB
+      detail: >
+        From the same headers. Per-GPU residency at TP8 is derived in the design
+        note's ledger, not here, because it depends on which tensors shard.
+
+  # Nothing in this entry is fitted. What the schema cannot express is listed
+  # under unmodelled, with the reconciliation item that would add it.
+  estimated: []
+
+  open:
+    - question: Q1 KV cache storage dtype, fp8 or bf16
+      detail: >
+        A serving decision (see kv_dtype). fp8 halves the KV line of the ledger.
+        Resolve from the engine launch args; kv_dtype is set to the baseline's
+        request.
+    - question: Q2 expert sharding, TP-sliced experts or whole experts per rank
+      detail: >
+        The reference keeps n_routed_experts // world_size whole experts per
+        rank and combines with an all-reduce (model.py:623, :647); vLLM without
+        --enable-expert-parallel slices every expert along the intermediate dim.
+        Per-rank distinct-expert bytes are the same either way; the collective
+        and the load balance are not. Resolve from the launch args.
+    - question: Q3 are mtp.* weights resident when speculation is disabled
+      detail: >
+        Not determinable from the checkpoint. 10.86 GB model-wide, ~1.36 GB per
+        GPU if sharded like the backbone. The ledger carries both lines.
+    - question: Q4 indexer projection sharding and the index-score all-reduce
+      detail: >
+        The reference shards indexer.wq_b and weights_proj by head and
+        all-reduces the score (model.py:399-400, :428-429), 21 extra collectives
+        per step; the planner assumes them replicated with no collective.
+
+  unmodelled:
+    - Compressor projections (bf16, replicated, two per compressor, a second
+      compressor inside each indexer). No spec field; RECONCILIATION.md B4.
+    - Per-op dtypes for the router (bf16/fp32), mHC (fp32), embed and lm_head
+      (bf16), indexer.weights_proj (bf16). The sparse_moe family has no
+      op_dtype_overrides; the glm_moe_dsa family has one. B11.
+    - The 128-token window buffer every layer holds (model.py:479), not only
+      the two swa layers. B12.
+    - The embedding all-reduce (model.py:110) and the logits all-gather (:738).
+    - Prefill. BatchConfig.prefill_tokens is accepted by the family, but the
+      compressor's prefill path (model.py:331-348) and the indexer's causal
+      candidate mask (:430-432) have not been checked against it.

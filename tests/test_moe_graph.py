@@ -320,13 +320,29 @@ def test_compress_ratios_truncate_to_layer_count(spec):
 
 
 def test_kv_latent_is_shared_across_query_heads(spec):
-    """num_kv_heads == 1: one latent of 512+64, not 64 heads of it.
+    """num_kv_heads == 1: one latent of 512, not 64 heads of it.
 
     Modelling this as GQA would inflate decode KV traffic 64x and make every
     long-context run look catastrophically memory-bound.
     """
-    assert spec.kv_latent_dim == 512 + 64
+    assert spec.kv_latent_dim == 512
     assert spec.kv_latent_dim < spec.n_heads * spec.head_dim
+
+
+def test_rope_slice_lives_inside_head_dim(spec):
+    """``head_dim`` is 512 *including* the 64 RoPE dims, not 512 + 64.
+
+    ``inference/model.py`` sets ``nope_head_dim = head_dim - rope_head_dim``,
+    projects ``wq_b`` to ``n_heads * head_dim`` and ``wkv`` to ``head_dim``, and
+    rotates ``[..., -rd:]`` of each; the shards store ``wq_b.weight
+    [32768, 1024]`` and ``wkv.weight [512, 4096]``. The V3 convention of adding
+    a separate RoPE block would widen every q-side and KV term by 576/512 and
+    misprice the KV entry (and so the concurrency ceiling) by the same ratio.
+    """
+    assert spec.n_heads * spec.q_head_dim == 32768  # wq_b rows
+    assert spec.kv_latent_dim == 512  # wkv rows == one cache entry
+    # 448 dims at fp8 (one byte each) + 64 RoPE dims kept in bf16
+    assert kv_entry_bytes(spec) == pytest.approx(448 * weight_bytes("fp8") + 64 * 2)
 
 
 # ── the assembled graph ─────────────────────────────────────────────────────
@@ -389,9 +405,27 @@ def test_speculative_positions_amortise_cache_reads_but_not_flops(spec, b200):
 
 def test_mtp_head_emits_layers_beyond_the_stack(spec, b200):
     """The draft head is layer 43, not a renamed op — layer index is the identity."""
-    g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    g = predict_moe_graph(
+        spec, b200, BatchConfig(batch=1, kv_cache_len=1024, speculative_tokens=1)
+    )
     layers = {n.layer for n in g.nodes if n.layer is not None}
     assert max(layers) == spec.n_layers  # 43 == one MTP layer past 0..42
+
+
+def test_mtp_head_is_absent_without_speculation(spec, b200):
+    """``num_nextn_predict_layers`` says the draft blocks ship, not that they run.
+
+    DeepSeek-V4-Flash's reference implementation runs ``mtp.*`` only in
+    ``Transformer.forward_spec``; a server without speculation never calls it.
+    Pricing the head anyway put a phantom full layer into every non-speculative
+    step. The weights stay in the footprint: resident is not the same as run.
+    """
+    g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    layers = {n.layer for n in g.nodes if n.layer is not None}
+    assert max(layers) == spec.n_layers - 1
+    assert model_weight_bytes(spec) > model_weight_bytes(
+        replace(spec, num_nextn_predict_layers=0)
+    )
 
 
 def test_dspark_only_on_its_declared_layers(spec, b200):
@@ -400,10 +434,54 @@ def test_dspark_only_on_its_declared_layers(spec, b200):
 
 
 def test_estimated_nodes_are_flagged(spec, b200):
-    """Approximations must be visible to the report, never silent in the total."""
+    """Approximations must be visible to the report, never silent in the total.
+
+    The grouped output projection is no longer one: its shape is read from the
+    checkpoint (``wo_a [8192, 4096]``, ``wo_b [4096, 8192]``), not guessed.
+    """
     g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
     estimated = {n.op for n in g.nodes if n.prediction.estimated}
-    assert estimated == {"attn_out_proj", "dspark"}
+    assert estimated == {"dspark"}
+
+
+def test_shared_expert_is_priced_at_weight_dtype(spec, b200):
+    """``expert_dtype`` covers the routed bank only; the shared expert is fp8.
+
+    ``inference/model.py`` (``MoE.__init__``) builds routed experts with
+    ``dtype=expert_dtype`` and the shared expert on the default fp8 path, and
+    the shards store ``ffn.shared_experts.w{1,2,3}.weight`` as fp8 e4m3 with
+    128x128 scales. Pricing it at fp4 halved a replicated-or-sharded term that
+    every step pays in full.
+    """
+    assert spec.expert_dtype == "fp4" and spec.weight_dtype == "fp8"
+    g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    node = next(n for n in g.nodes if n.op == "moe_shared")
+    weights = 3 * spec.hidden * spec.moe_intermediate_size * weight_bytes("fp8")
+    assert node.prediction.bytes == pytest.approx(weights, rel=0.01)
+    assert node.prediction.dtype == "fp8"
+
+
+def test_grouped_output_projection_carries_the_full_rank_per_group(spec, b200):
+    """Every o-group carries all of ``o_lora_rank``, not ``o_lora_rank / o_groups``.
+
+    DeepSeek-V4-Flash ``inference/model.py`` builds ``wo_a`` as
+    ``(n_heads*head_dim // n_groups) -> n_groups * o_lora_rank`` and ``wo_b`` as
+    ``n_groups * o_lora_rank -> dim``; the shards store ``wo_a.weight
+    [8192, 4096]`` and ``wo_b.weight [4096, 8192]``. Splitting the rank across
+    groups instead priced ``wo_a`` 8x small, and the ``estimated`` flag hid it.
+    """
+    wo_a = spec.o_groups * spec.o_lora_rank * (spec.n_heads * spec.head_dim // spec.o_groups)
+    wo_b = spec.hidden * spec.o_groups * spec.o_lora_rank
+    assert wo_a == 8192 * 4096 and wo_b == 4096 * 8192
+    for tp in (1, 8):
+        g = predict_moe_graph(
+            spec, b200, BatchConfig(batch=1, kv_cache_len=1024), ShardingConfig(tp=tp)
+        )
+        node = next(n for n in g.nodes if n.op == "attn_out_proj")
+        weights = (wo_a + wo_b) / tp * weight_bytes(spec.weight_dtype)
+        # at one position the activations are a rounding term on the weights
+        assert node.prediction.bytes == pytest.approx(weights, rel=0.01)
+        assert node.prediction.flops == pytest.approx(2 * (wo_a + wo_b) / tp)
 
 
 def test_tokens_per_step_accounts_for_acceptance():
@@ -620,12 +698,12 @@ def test_dspark_variant_is_a_lower_bound_not_an_estimate(spec, base_spec):
 def test_base_checkpoint_has_no_dspark_nodes(base_spec, b200):
     """No dspark keys in the config means no dspark work in the graph.
 
-    Which makes the base checkpoint the better pilot target: its only
-    shape-estimated node is the grouped output projection.
+    Which makes the base checkpoint the better pilot target: it has no
+    shape-estimated node at all.
     """
     g = predict_moe_graph(base_spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
     assert not [n for n in g.nodes if n.op == "dspark"]
-    assert {n.op for n in g.nodes if n.prediction.estimated} == {"attn_out_proj"}
+    assert {n.op for n in g.nodes if n.prediction.estimated} == set()
 
 
 def test_both_checkpoint_variants_yield_identical_per_layer_ratios(spec, base_spec):
