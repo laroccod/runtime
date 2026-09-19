@@ -403,7 +403,7 @@ class SparseMoEModelSpec:
 
     # Precision, per tensor class
     weight_dtype: str = "fp8"  # attention + router + lm_head linears
-    expert_dtype: str = "fp4"  # routed + shared expert weights
+    expert_dtype: str = "fp4"  # routed expert weights; the shared expert is a weight_dtype linear
     kv_dtype: str = "fp8"  # KV cache and index keys
     act_dtype: str = "bf16"  # activations between ops
 

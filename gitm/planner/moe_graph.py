@@ -27,7 +27,8 @@ and they dominate the attention cost at long sequence lengths. Folding these int
 one op — as a dense graph must — averages a 13x spread at 1M context and
 attributes deviation to whichever layer happened to be modelled.
 
-**Precision is per-tensor-class.** Experts run fp4, linears fp8, the KV cache fp8.
+**Precision is per-tensor-class.** Routed experts run fp4; the shared expert and
+the linears fp8; the KV cache fp8.
 The load-bearing half of this is *bytes*, not FLOPs: pricing fp4 expert weights at
 bf16 inflates the dominant term 3.3x. The peak-FLOPS half barely moves a decode
 step — every node is memory-bound, so the compute ceiling never binds — but it
@@ -153,8 +154,9 @@ def model_weight_bytes(
 
     Decides whether a deployment shape is possible at all, which the timing graph
     cannot: a config that predicts beautifully and does not fit is not a config.
-    Counts experts at ``expert_dtype`` and everything else at ``weight_dtype``,
-    since collapsing the two is a ~3x error on the dominant term.
+    Counts routed experts at ``expert_dtype`` and everything else, the shared
+    expert included, at ``weight_dtype``, since collapsing the two is a ~3x error
+    on the dominant term.
 
     Validated against ground truth: ``DeepSeek-V4-Flash`` predicts 156 GB against
     a published 160 GB checkpoint (-2.4%), the residual being norms, biases and
@@ -176,7 +178,7 @@ def model_weight_bytes(
     layers = spec.n_layers + spec.num_nextn_predict_layers
 
     experts = layers * spec.n_routed_experts * 3 * h * inter * ew / es
-    shared = layers * spec.n_shared_experts * 3 * h * inter * ew / tp
+    shared = layers * spec.n_shared_experts * 3 * h * inter * ww / tp  # fp8, not expert_dtype
     attn_per_layer = (
         h * spec.q_lora_rank  # q_a, replicated
         + spec.q_lora_rank * spec.n_heads * spec.q_head_dim / tp
@@ -478,12 +480,19 @@ def _emit_layer(
     per_position_flops = 6.0 * h * inter  # 2 * (gate + up + down) * h * inter
 
     if spec.n_shared_experts > 0:
+        # The shared expert is not an ``expert_dtype`` tensor. The reference
+        # builds routed experts with ``dtype=expert_dtype`` and the shared expert
+        # on the default (fp8) path (``inference/model.py``, ``MoE.__init__``:
+        # ``Expert(..., dtype=expert_dtype)`` vs ``Expert(args.dim,
+        # args.moe_inter_dim, ...)``), and the shards store
+        # ``ffn.shared_experts.w{1,2,3}.weight`` as fp8 e4m3 with 128x128
+        # scales. Pricing it at fp4 alongside the routed bank halved its bytes.
         add(
             "moe_shared",
             per_position_flops * positions * spec.n_shared_experts / tp,
-            per_expert_weights * spec.n_shared_experts * ew / tp
+            per_expert_weights * spec.n_shared_experts * ww / tp
             + aw * (positions * h * 2 + positions * inter * 2 * spec.n_shared_experts / tp),
-            ed,
+            wd,
         )
 
     # Shared with the dense MoE roofline — one owner for the union term. Note the

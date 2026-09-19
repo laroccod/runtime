@@ -444,6 +444,23 @@ def test_estimated_nodes_are_flagged(spec, b200):
     assert estimated == {"dspark"}
 
 
+def test_shared_expert_is_priced_at_weight_dtype(spec, b200):
+    """``expert_dtype`` covers the routed bank only; the shared expert is fp8.
+
+    ``inference/model.py`` (``MoE.__init__``) builds routed experts with
+    ``dtype=expert_dtype`` and the shared expert on the default fp8 path, and
+    the shards store ``ffn.shared_experts.w{1,2,3}.weight`` as fp8 e4m3 with
+    128x128 scales. Pricing it at fp4 halved a replicated-or-sharded term that
+    every step pays in full.
+    """
+    assert spec.expert_dtype == "fp4" and spec.weight_dtype == "fp8"
+    g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
+    node = next(n for n in g.nodes if n.op == "moe_shared")
+    weights = 3 * spec.hidden * spec.moe_intermediate_size * weight_bytes("fp8")
+    assert node.prediction.bytes == pytest.approx(weights, rel=0.01)
+    assert node.prediction.dtype == "fp8"
+
+
 def test_grouped_output_projection_carries_the_full_rank_per_group(spec, b200):
     """Every o-group carries all of ``o_lora_rank``, not ``o_lora_rank / o_groups``.
 
