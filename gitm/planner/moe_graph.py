@@ -51,9 +51,9 @@ Known limits, stated rather than hidden:
   Real routing is skewed, which touches *fewer* distinct experts and so moves less
   weight traffic than predicted — the conservative direction, since it under-reports
   headroom rather than inventing it.
-* **Nodes marked** ``estimated`` **are documented approximations** (grouped output
-  projection, DSpark, every collective) and carry that flag into the report so an
-  estimate is never read as a measurement.
+* **Nodes marked** ``estimated`` **are documented approximations** (DSpark, every
+  collective) and carry that flag into the report so an estimate is never read
+  as a measurement.
 * **Expert-parallel skew is calibrated, not predicted.**
   :attr:`ShardingConfig.ep_imbalance` defaults to perfect balance; the real figure
   comes from a trace. Inventing a routing distribution here would be a guess
@@ -182,8 +182,10 @@ def model_weight_bytes(
         + spec.q_lora_rank * spec.n_heads * spec.q_head_dim / tp
         + h * spec.kv_latent_dim  # kv_a, replicated
         + h * spec.index_n_heads * spec.index_head_dim / tp
-        + spec.n_heads * spec.head_dim * spec.o_lora_rank / (spec.o_groups * tp)
-        + spec.o_lora_rank * h
+        # grouped output projection, wo_a [o_groups*o_lora_rank, n_heads*head_dim/o_groups]
+        # and wo_b [h, o_groups*o_lora_rank], both sharded by tp (see _emit_layer)
+        + spec.n_heads * spec.head_dim * spec.o_lora_rank / tp
+        + spec.o_groups * spec.o_lora_rank * h / tp
         + h * spec.n_routed_experts  # router, replicated
     )
     embed = 2 * spec.vocab * h / tp  # input embedding + untied lm_head
@@ -401,16 +403,27 @@ def _emit_layer(
         spec.act_dtype,
     )
 
-    # Output projection, grouped and low-rank. ``o_groups`` partitions the head
-    # dimension so each group carries its own slice of the rank — modelled as an
-    # even split, which is the documented reading of the config and not a
-    # published shape, hence ``estimated``.
-    o_in = spec.n_heads * spec.head_dim // tp
-    f_a, b_a = _linear(positions, o_in, max(1, spec.o_lora_rank // spec.o_groups), aw, ww)
-    f_b, b_b = _linear(positions, spec.o_lora_rank, h, aw, ww)
+    # Output projection, grouped and low-rank. ``o_groups`` partitions the heads
+    # into groups and *every group carries the full* ``o_lora_rank``: wo_a is
+    # ``[o_groups * o_lora_rank, n_heads * head_dim / o_groups]``, applied
+    # block-diagonally with one ``[o_lora_rank, group_width]`` block per group,
+    # and wo_b maps the concatenated ``o_groups * o_lora_rank`` back to hidden.
+    # DeepSeek-V4-Flash ``inference/model.py``, ``Attention.__init__``:
+    # ``wo_a = ColumnParallelLinear(n_heads * head_dim // n_groups, n_groups *
+    # o_lora_rank)``, ``wo_b = RowParallelLinear(n_groups * o_lora_rank, dim)``;
+    # ``forward``: ``einsum("bsgd,grd->bsgr", o, wo_a.view(groups, rank, -1))``.
+    # Shard shapes agree: ``wo_a.weight [8192, 4096]``, ``wo_b.weight [4096,
+    # 8192]``, fp8. Reading the rank as split *across* the groups priced wo_a
+    # 8x small. Groups shard with the heads under TP (``n_local_groups =
+    # n_groups // world_size``), so per rank wo_a is ``[o_groups * o_lora_rank /
+    # tp, group_width]`` and wo_b is ``[hidden, o_groups * o_lora_rank / tp]``.
+    group_width = spec.n_heads * spec.head_dim // max(1, spec.o_groups)
+    o_rank = max(1, spec.o_groups * spec.o_lora_rank // tp)
+    f_a, b_a = _linear(positions, group_width, o_rank, aw, ww)
+    f_b, b_b = _linear(positions, o_rank, h, aw, ww)
     # Named to match the dense graph's output projection: it is the same op in
     # the same place, so residuals for it stay comparable across model families.
-    add("attn_out_proj", f_a + f_b, b_a + b_b, wd, estimated=True)
+    add("attn_out_proj", f_a + f_b, b_a + b_b, wd)
 
     # ── manifold-constrained hyper-connections ──────────────────────────────
     # Two per block (around attention, around the MoE). The residual stream is

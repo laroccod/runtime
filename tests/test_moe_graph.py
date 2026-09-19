@@ -418,10 +418,37 @@ def test_dspark_only_on_its_declared_layers(spec, b200):
 
 
 def test_estimated_nodes_are_flagged(spec, b200):
-    """Approximations must be visible to the report, never silent in the total."""
+    """Approximations must be visible to the report, never silent in the total.
+
+    The grouped output projection is no longer one: its shape is read from the
+    checkpoint (``wo_a [8192, 4096]``, ``wo_b [4096, 8192]``), not guessed.
+    """
     g = predict_moe_graph(spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
     estimated = {n.op for n in g.nodes if n.prediction.estimated}
-    assert estimated == {"attn_out_proj", "dspark"}
+    assert estimated == {"dspark"}
+
+
+def test_grouped_output_projection_carries_the_full_rank_per_group(spec, b200):
+    """Every o-group carries all of ``o_lora_rank``, not ``o_lora_rank / o_groups``.
+
+    DeepSeek-V4-Flash ``inference/model.py`` builds ``wo_a`` as
+    ``(n_heads*head_dim // n_groups) -> n_groups * o_lora_rank`` and ``wo_b`` as
+    ``n_groups * o_lora_rank -> dim``; the shards store ``wo_a.weight
+    [8192, 4096]`` and ``wo_b.weight [4096, 8192]``. Splitting the rank across
+    groups instead priced ``wo_a`` 8x small, and the ``estimated`` flag hid it.
+    """
+    wo_a = spec.o_groups * spec.o_lora_rank * (spec.n_heads * spec.head_dim // spec.o_groups)
+    wo_b = spec.hidden * spec.o_groups * spec.o_lora_rank
+    assert wo_a == 8192 * 4096 and wo_b == 4096 * 8192
+    for tp in (1, 8):
+        g = predict_moe_graph(
+            spec, b200, BatchConfig(batch=1, kv_cache_len=1024), ShardingConfig(tp=tp)
+        )
+        node = next(n for n in g.nodes if n.op == "attn_out_proj")
+        weights = (wo_a + wo_b) / tp * weight_bytes(spec.weight_dtype)
+        # at one position the activations are a rounding term on the weights
+        assert node.prediction.bytes == pytest.approx(weights, rel=0.01)
+        assert node.prediction.flops == pytest.approx(2 * (wo_a + wo_b) / tp)
 
 
 def test_tokens_per_step_accounts_for_acceptance():
@@ -638,12 +665,12 @@ def test_dspark_variant_is_a_lower_bound_not_an_estimate(spec, base_spec):
 def test_base_checkpoint_has_no_dspark_nodes(base_spec, b200):
     """No dspark keys in the config means no dspark work in the graph.
 
-    Which makes the base checkpoint the better pilot target: its only
-    shape-estimated node is the grouped output projection.
+    Which makes the base checkpoint the better pilot target: it has no
+    shape-estimated node at all.
     """
     g = predict_moe_graph(base_spec, b200, BatchConfig(batch=1, kv_cache_len=1024))
     assert not [n for n in g.nodes if n.op == "dspark"]
-    assert {n.op for n in g.nodes if n.prediction.estimated} == {"attn_out_proj"}
+    assert {n.op for n in g.nodes if n.prediction.estimated} == set()
 
 
 def test_both_checkpoint_variants_yield_identical_per_layer_ratios(spec, base_spec):
